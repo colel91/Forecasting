@@ -1,0 +1,716 @@
+---
+title: "FRG Demand Foreasting"
+date: "`r format(Sys.time(), '%B %d,%Y')`"
+output:
+  html_document: default
+  word_document: default
+  pdf_document: default
+---
+
+```{r cars, echo = FALSE, message=FALSE,warning=FALSE,error = FALSE}
+
+suppressMessages(library(tidyr))
+suppressMessages(library(dplyr))
+suppressMessages(library(readxl))
+suppressMessages(library(lubridate))
+suppressMessages(library(ggplot2))
+suppressMessages(library(forecast))
+suppressMessages(library(tseries))
+suppressMessages(library(prophet))
+suppressMessages(library(base))
+suppressMessages(library(purrr))
+suppressMessages(library(outliers))
+suppressMessages(library(Hmisc))
+suppressMessages(library(reshape2))
+suppressMessages(library(data.table))
+suppressMessages(library(pbapply))
+suppressMessages(library(knitr))
+suppressMessages(library(ggthemes))
+suppressMessages(library(kableExtra))
+suppressMessages(library(formattable))
+suppressMessages(library(plotly))
+suppressMessages(library(RMySQL))
+
+#User Inputs-----------------------------------------
+numdays_forecast <- 29 #29 optimal if run on Monday
+days_to_stabilize <- 145 # 145 optimal
+RDC <- "FRG" #choose RDc, FRG or GRM
+FRG.nethours <- 7
+GRM.nethours <- 7
+FRG.utilization <- 0.72
+GRM.utilization <- 0.75
+
+
+FRG.workedhours <- FRG.nethours * FRG.utilization
+GRM.workedhours <- GRM.nethours * GRM.utilization
+#pick rates for hours required forecasting
+FRG.Ambient <- 151
+FRG.Produce <- 192
+FRG.Chiller <- 169
+FRG.Meat <- 207
+FRG.Freezer <- 199
+FRG.NF <- 277
+FRG.Bread <- 185
+FRG.Bulk <- 3600
+FRG.Milk <- 27
+GRM.Ambient <- 104 
+GRM.Produce <- 105
+GRM.Chiller <- 130
+GRM.Meat <- 152
+GRM.Freezer <- 141
+GRM.NF <- 181
+GRM.Bread <- 87
+GRM.Bulk <- 3600
+GRM.Milk <- 27
+
+#Days offet
+#The source data is based off of "Store delivery date" rather than pick date
+#These parameters will change the date at the end to align with 
+daysoffset.ambient <- 1
+daysoffset.produce <- 1
+daysoffset.chiller <- 1
+daysoffset.meat <- 1
+daysoffset.freezer <- 1
+daysoffset.nf <- 1
+daysoffset.milk <- 1
+daysoffset.bread <- 1
+daysoffset.bulk <- 1
+
+
+#load files-------------------------------------------------------------
+train.cases <- read_excel("Forecasting Opening to 11.18.2018.xlsx", skip = 7, col_types = c("date","text","text","text","text","numeric","numeric","text","text","text","text","text","text","text","text"))
+store.openings <- read_excel("Store Opening Timeline.xlsx",col_types = c("text","text","date","text","text"))
+area.num <- read_excel("area numbers.xlsx")
+calendar <- read_excel("calendar.xlsx")
+
+#remove unnecessary columns and rename headers--------------------------
+train.cases <- train.cases[,-c(7:15)]
+names(train.cases) <- c("ds","store","store.name","promo.area","item","y")
+store.openings$store <- as.integer(store.openings$store)
+
+#filter out summaries and convert delivery.date to date type------------
+train.cases <- train.cases %>%
+  filter(store != "Result",item != "73/Not assigned",item != "Freezer Bakeoff A7S1",
+         item !="Ambient A100", item != "Chiller Reserve A501",item != "Ambient Reserve A101",
+         item !="Freezer Reserve A701",item != "Freezer Assortment A",item != "Undefined",
+         store != "5",store != "6",store != "0005",store != "0006") %>%
+    select(-3,-4) %>%
+      left_join(area.num, by = "item") %>%
+        select(-3)
+
+train.cases$y[is.na(train.cases$y)] <- 0
+
+names(train.cases) <- c("ds","store","y","item")
+train.cases$item <- as.character(train.cases$item)
+
+#functions - right, to extract store number----------------------------------
+right = function(text, num_char) {
+  substr(text, nchar(text) - (num_char-1), nchar(text))
+}
+train.cases$store <- right(train.cases$store,4)
+train.cases$store <- as.integer(train.cases$store)
+
+
+
+#Create template for non-opened stores
+#high turnover modeled off Ashburn and Woodbridge-----------------------------
+high_turnover <- train.cases %>%
+  filter(store == 1215 | store == 1031) %>%
+    left_join(store.openings, by = "store") %>%
+      select(-5,-7) %>%
+        mutate(reference.date = difftime(ds,opening.date,units = "days")) %>%
+          group_by(reference.date,item) %>%
+            summarise(y = mean(y)) %>%
+              mutate(proj.turnover = "high")
+#medium turnover modeled off Wake Forest and Norfolk--------------------------------
+med_turnover <- train.cases %>%
+  filter(store == 1033 | store == 1103) %>%
+    left_join(store.openings, by = "store") %>%
+      select(-5,-7) %>%
+        mutate(reference.date = difftime(ds,opening.date,units = "days")) %>%
+          group_by(reference.date,item) %>%
+            summarise(y = mean(y)) %>%
+              mutate(proj.turnover = "med") 
+#low turnover modeled off Winston Salem and North chesterfield----------------------
+low_turnover <- train.cases %>%
+  filter(store == 1010 | store == 1001) %>%
+    left_join(store.openings, by = "store") %>%
+      select(-5,-7) %>%
+        mutate(reference.date = difftime(ds,opening.date,units = "days")) %>%
+          group_by(reference.date,item) %>%
+            summarise(y = mean(y)) %>%
+                mutate(proj.turnover = "low")
+combined_turnover <- rbind(high_turnover,med_turnover,low_turnover)
+
+
+#demand forecasting for future store openings and store openings under 52 days old!---------
+#creates date dataframe based on the max data + 365 days
+date_range <- as.data.frame(seq((max(train.cases$ds)+as.difftime(1,units = "days")),(max(train.cases$ds)+as.difftime(1,units = "days"))+as.difftime(365, unit="days"), by = "days"))
+names(date_range) <- "ds"
+
+#filters the store opening table to only include stores that are greater than the opening date
+#plus the stability period once a store opens
+future.openings <- store.openings %>%
+  filter(opening.date + as.difftime((days_to_stabilize),unit="days") > max(train.cases$ds)) %>%
+    select(-2,-4,-5) %>%
+      spread(store,opening.date) 
+
+
+future.openings[2:366,] <- future.openings[1,]
+future_demand <- bind_cols(date_range,future.openings)
+for (i in 2:ncol(future_demand)) {
+  future_demand[,i] <- difftime(future_demand[,1],future_demand[,i], units = c("days"))
+}          
+future_demand <- future_demand %>%
+  gather(-ds, key = "store",value = "reference.date") 
+future_demand$store <- as.integer(future_demand$store)
+
+future_demand <- future_demand %>%
+  left_join(store.openings, by = "store") %>%
+  filter(region == RDC) %>%
+    select(-4,-5,-6) %>%
+  full_join(combined_turnover, by = c("proj.turnover","reference.date")) %>%
+    select(-3,-4) %>%
+      filter(ds <= (max(train.cases$ds)+as.difftime(numdays_forecast+1, unit = "days")))
+
+#remove null demands and ensure dates greater than the forecast period are not taken-----------
+future_demand <- na.omit(future_demand)
+future_demand <- future_demand %>%
+  select(1,2,4,3) %>%
+    filter(ds < (max(train.cases$ds) + as.difftime(numdays_forecast+1, unit="days")))
+future_demand$year <- year(future_demand$ds)
+future_demand$week <- week(future_demand$ds)
+future_demand$week.year <- paste0(future_demand$year,"-",future_demand$week)
+
+#Create DF before train.cases removes the non-opened and recently opened stores----------------
+actual.cases <- train.cases %>% left_join(store.openings, by = "store") %>% filter(region == RDC) %>% select(-5:-8)
+
+#calculate the difference in days between ds and the store opening date    --------------         
+
+#data from store opening is filtered out. Steady state happens around 52 days after opening
+#stores will use forecasted data based on low,med,high turnover until 3 weeks after that 52 day period
+
+train.cases <- left_join(train.cases,store.openings, by = "store")
+train.cases <- train.cases %>%
+  filter(ds > (opening.date + as.difftime(days_to_stabilize, unit="days")), region == RDC) %>%
+    select(-5,-6,-7)
+train.cases <- as.data.table(train.cases)
+
+#split data by store and area
+train.cases$store <- as.integer(train.cases$store)
+train.cases$item <- as.integer(train.cases$item)
+
+#splits data so that a map function can be applied to each store,area combo
+train_splitting = split(train.cases, by=c('store','item') ,keep.by = FALSE)
+
+#holidays---------------------------------------------------------------------------        
+thanksgiving <- data_frame(
+  holiday = 'thanksgiving',
+  ds = as.Date(c('2017-11-23','2018-11-22','2019-11-28','2020-11-26')),
+  lower_window = -2,
+  upper_window = 2
+)
+christmas <- data_frame(
+  holiday = 'christmas',
+  ds = as.Date(c('2017-12-25','2018-12-25','2019-12-25','2020-12-25')),
+  lower_window = -2,
+  upper_window = 2
+)
+july_fourth <- data_frame(
+  holiday = "july_fourth",
+  ds = as.Date(c('2017-07-04','2018-07-04','2019-07-04','2020-07-04')),
+  lower_window = -2,
+  upper_window = 2
+)
+new_years_day <- data_frame(
+  holiday = "new_years_day",
+  ds = as.Date(c('2017-01-01','2018-01-01','2019-01-01','2020-01-01')),
+  lower_window = -2,
+  upper_window = 2
+)
+holidays <- bind_rows(thanksgiving,christmas,july_fourth,new_years_day)
+
+
+#For tuning the parameters, all stores opened before December of 2017 were used as model stores=
+#train <- train.cases %>%
+#filter(store == 1009 | store == 1010 | store == 1042 | store == 1050 | store == 1057 | store == 1058 | store == 1064 | store == 1074 | store == 1076 | store == 1098 | store == 1033 | store == 1036 | store == 1053 | store == 1063 | store == 1085 | store == 1088 | store == 1103 | store == 1001 | store == 1019 | store == 1060 | store == 1106 | store == 1037 | store == 1016 | store == 1129 | store == 1076 | store == 1029 | store == 1089 | store == 1099 | store == 1126 | store == 1052 | store == 1132 | store == 1015 | store == 1024 | store == 1056 | store == 1117 | store == 1006 | store == 1017 | store == 1040,  ds > "2018-01-01", ds < "2018-09-31") %>%
+#  filter(item != 9 | item != 2) %>%  
+#  group_by(ds) %>%
+#     summarise(y = sum(y))
+
+#valid <- train.cases %>%
+#  filter(store == 1009 | store == 1010 | store == 1042 | store == 1050 | store == 1057 | store == 1058 | store == 1064 | store == 1074 | store == 1076 | store == 1098 | store == 1033 | store == 1036 | store == 1053 | store == 1063 | store == 1085 | store == 1088 | store == 1103 | store == 1001 | store == 1019 | store == 1060 | store == 1106 | store == 1037 | store == 1016 | store == 1129 | store == 1076 | store == 1029 | store == 1089 | store == 1099 | store == 1126 | store == 1052 | store == 1132 | store == 1015 | store == 1024 | store == 1056 | store == 1117 | store == 1006 | store == 1017 | store == 1040,  ds > "2018-09-31") %>%
+#  filter(item != 9 | item != 2) %>%
+#  group_by(ds) %>%
+#  summarise(y = sum(y))
+
+#search grid of parameters for options
+prophetGrid <- expand.grid(
+weekly_seasonality = c(1,2,4,6,8,10),
+changepoint_prior_scale = c(0.001,0.0015,0.002,0.004,0.006,0.01,0.02,0.04),
+holidays_prior_scale = c(0.005,0.1,0.15,0.2,0.3,0.4,0.6,0.7,0.8,1),
+growth = 'linear'
+)
+
+
+#results <- vector(mode = 'numeric', length = nrow(prophetGrid))
+
+#Search best parameters - unhash if you wish to use
+#for (i in seq_len(nrow(prophetGrid))) {
+#  parameters <- prophetGrid[i, ]
+#  if (parameters$growth == 'logistic') {train$cap <- parameters$capacity}
+ 
+#  m <- prophet(train, growth = parameters$growth, holidays = holidays,
+#               weekly.seasonality = parameters$weekly_seasonality, 
+#               changepoint.prior.scale = parameters$changepoint_prior_scale,
+#             holidays.prior.scale = parameters$holidays_prior_scale)
+             
+  
+  #future <- make_future_dataframe(m, periods = nrow(valid))
+  #if (parameters$growth == 'logistic') {future$cap <- parameters$capacity}
+  
+  # NOTE: There's a problem in function names with library(caret)
+ # forecast <- predict(m, future)
+  
+# results[i] <- forecast::accuracy(forecast[forecast$ds %in% valid$ds, 'yhat'], valid$y)[ , 'MAE']
+#}
+
+#prophetGrid <- cbind(prophetGrid, results)
+#best_params <- prophetGrid[prophetGrid$results == min(results), ]
+
+
+
+
+#Prophet Function-------------------------------------------------------------------
+prediction<-function(df) {
+
+  model_prophet <- suppressMessages(prophet())
+#changepoint 0.1, weekly = 2
+  model_prophet <- suppressMessages(prophet(df, holidays.prior.scale = 0.8, interval.width = 0.80,changepoint.prior.scale = 0.02, weekly.seasonality = 1, yearly.seasonality = FALSE, holidays = holidays))
+  future = make_future_dataframe(model_prophet, periods = numdays_forecast)
+  forecast = suppressMessages(predict(model_prophet, future))
+  forecast_final <-suppressMessages(xts::last(forecast[, c("ds","yhat","yhat_lower","yhat_upper")],numdays_forecast))
+  suppressMessages(return(forecast_final))
+}
+#Prophet function applied to all iterations of store/area--------------------------
+#output to a user-friendly dataframe-----------------------------------------------
+final_output <-suppressMessages(map_dfr(train_splitting,prediction,.id = "store"))
+
+#cleaning up columns and headers
+final_output <- final_output %>%
+  separate(store,into = c("store","item"))
+
+final_output$store <- as.integer(final_output$store)
+final_output <- final_output[,c(3,1,4,2,5,6)]
+names(final_output) <- c("ds","store","y","item","yhat_lower","yhat_upper")
+final_output$item <- as.integer(final_output$item)
+
+#combine the forecast with the training set
+
+final_output$item <- as.character(final_output$item)
+
+actual.cases$item <- as.character(actual.cases$item)
+future_demand$item <- as.character(future_demand$item)
+future_demand$ds <- as.POSIXct(future_demand$ds)
+future_demand <- future_demand %>%
+  select(-5:-7)
+
+
+test_combined <- bind_rows(final_output,actual.cases,future_demand)
+test_combined <- left_join(test_combined,store.openings, by = "store")
+test_combined$ds <- test_combined$ds - as.difftime(1,unit="days")
+
+```
+
+## Case Forecasting by Area {.tabset .tabset-fade .tabset-pills}
+
+### Ambient  
+**Ambient Cases Projected by Day**
+```{r totalbyday graph, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+graph_ds <- max(actual.cases$ds) - as.difftime(180, unit="days")
+ggplotly(ggplot((test_combined %>%
+        filter(item == 1, ds > graph_ds) %>%
+        group_by(ds) %>%
+        summarise(cases = sum(y))), aes(x = ds, y = cases)) + geom_line() +                 theme_fivethirtyeight() + geom_vline(xintercept = as.numeric(max(train.cases$ds)),color="red",linetype="dashed") + scale_fill_discrete(name = "Status") + theme(legend.position="none") + geom_point(aes(color=weekdays(ds))),width = 1100)
+
+```  
+  
+
+**Ambient Cases Projected by Week and Day**
+```{r weeknum graph, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+#useful code for troubleshooting why trends are happening
+#ggplot((test_combined %>% filter(item == 7, ds > "2018-11-01")), 
+#      aes(ds,y,color = ds > max(train.cases$ds))) + geom_line(aes(group=1)) + 
+#     facet_wrap(~store) + theme(legend.position = "top") + ylim(0,1000)
+
+#these measures are created to help the tables interpret which values are forecasted and which are actual             
+max.year <- as.numeric(format(max(train.cases$ds),"%Y"))        
+max.weekday <- weekdays(max(actual.cases$ds))
+max.week <- as.numeric(lubridate::isoweek(ymd(max(actual.cases$ds))))
+
+calendar$week.num <- as.character(calendar$week.num)
+calendar$year <- as.character(calendar$year)
+# TEST function that gets the data in the proper format to visualize with a table
+forecast_table <- function(dataframe,activity.area) {
+dataframe <- dataframe %>%
+  filter(item == activity.area, ds > (max(train.cases$ds) - as.difftime(27, unit="days"))) %>% #27 optimal for monday
+    left_join(calendar, by = "ds") %>%
+    mutate(ds = weekdays(ds)) %>%
+      group_by(ds,week.num,year) %>%
+        summarise(y = sum(y)) %>%
+          spread(ds,y) %>%
+            select(year,week.num,Monday,Tuesday,Wednesday,Thursday,Friday,Saturday,Sunday) %>%
+              arrange(year,week.num) %>%
+                rename(Year = year, 'Week Number' = week.num)
+dataframe <- as_tibble(dataframe)
+dataframe[is.na(dataframe)] <- 0
+dataframe <- dataframe %>%
+  mutate_if(is.numeric, round, 0)
+dataframe[dataframe == 0] <- NA
+
+dataframe$Year <- as.numeric(dataframe$Year)
+dataframe$`Week Number` <- as.numeric(dataframe$`Week Number`)
+return(dataframe)
+}
+
+#Create a function called table_plot that creates a special table for forecasting demand
+table_plot <- function(dataframe) {
+  dataframe %>%
+    
+  mutate(Wednesday = cell_spec(Wednesday, background = ifelse(dataframe$Year > max.year | (dataframe$Year == max.year) & (dataframe$`Week Number` > max.week) | dataframe$Year == max.year & dataframe$`Week Number` == max.week & (max.weekday == "Monday" | max.weekday == "Tuesday"),"lightgreen","white")),
+         Thursday = cell_spec(Thursday, background = ifelse(dataframe$Year > max.year | (dataframe$Year == max.year) & (dataframe$`Week Number` > max.week) | dataframe$Year == max.year & dataframe$`Week Number` == max.week & (max.weekday == "Monday" | max.weekday == "Tuesday" | max.weekday == "Wednesday"),"lightgreen","white")),
+         Friday = cell_spec(Friday, background = ifelse(dataframe$Year > max.year | (dataframe$Year == max.year) & (dataframe$`Week Number` > max.week) | dataframe$Year == max.year & dataframe$`Week Number` == max.week & (max.weekday == "Monday" | max.weekday == "Tuesday" | max.weekday == "Wednesday" | max.weekday == "Thursday"),"lightgreen","white")),
+         Saturday = cell_spec(Saturday, background = ifelse(dataframe$Year > max.year | (dataframe$Year == max.year) & (dataframe$`Week Number` > max.week) | dataframe$Year == max.year & dataframe$`Week Number` == max.week & (max.weekday == "Monday" | max.weekday == "Tuesday" | max.weekday == "Wednesday" | max.weekday == "Thursday" | max.weekday == "Friday"),"lightgreen","white")),
+         Sunday = cell_spec(Sunday, background = ifelse(dataframe$Year > max.year | (dataframe$Year == max.year) & (dataframe$`Week Number` > max.week) | dataframe$Year == max.year & dataframe$`Week Number` == max.week & (max.weekday == "Monday" | max.weekday == "Tuesday" | max.weekday == "Wednesday" | max.weekday == "Thursday" | max.weekday == "Friday" | max.weekday == "Saturday"),"lightgreen","white")),
+         Monday = cell_spec(Monday, background = ifelse(dataframe$Year > max.year | (dataframe$Year == max.year) & (dataframe$`Week Number` > max.week),"lightgreen","white")),
+         Tuesday = cell_spec(Tuesday, background = ifelse(dataframe$Year > max.year | (dataframe$Year == max.year) & (dataframe$`Week Number` > max.week) | dataframe$Year == max.year & dataframe$`Week Number` == max.week & (max.weekday == "Monday"),"lightgreen","white"))
+        ) %>%
+    arrange(Year,as.numeric(`Week Number`)) %>%
+  kable(format = "html", escape = F) %>%
+  kable_styling() %>%
+  footnote(symbol = "All values in green represent forecasted demands")
+}
+
+write.csv(test_combined, "test_combined.csv")
+
+table_ambient <- forecast_table(test_combined,1)
+table_plot(table_ambient)
+```
+
+**Forecasted Associates Required**  
+The anticipated number of associates are calculated from a pick rate in ambient of **`r ifelse(RDC=="FRG",FRG.Ambient,GRM.Ambient)`** cases per hour and **`r ifelse(RDC=="FRG",FRG.nethours,GRM.nethours)`** net hours worked by associate and an average utilization of **`r ifelse(RDC=="FRG",FRG.utilization * 100,GRM.utilization * 100)`**%.
+```{r totalhoursbyday graph ambient, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+table_plot(table_ambient %>%
+  mutate(Monday = round(Monday / (ifelse(RDC=="FRG",FRG.Ambient,GRM.Ambient)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Tuesday = round(Tuesday / (ifelse(RDC=="FRG",FRG.Ambient,GRM.Ambient)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Wednesday = round(Wednesday / (ifelse(RDC=="FRG",FRG.Ambient,GRM.Ambient)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Thursday = round(Thursday / (ifelse(RDC=="FRG",FRG.Ambient,GRM.Ambient)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Friday = round(Friday / (ifelse(RDC=="FRG",FRG.Ambient,GRM.Ambient)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Saturday = round(Saturday / (ifelse(RDC=="FRG",FRG.Ambient,GRM.Ambient)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Sunday = round(Sunday / (ifelse(RDC=="FRG",FRG.Ambient,GRM.Ambient)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0)))
+```
+
+###Bulk
+**Bulk Cases Projected by Day**
+```{r totalbyday graph bulk, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+ggplotly(ggplot((test_combined %>%
+        filter(item == 2, ds > graph_ds) %>%
+        group_by(ds) %>%
+        summarise(cases = sum(y))), aes(x = ds, y = cases)) + geom_line() +                 theme_fivethirtyeight() + geom_vline(xintercept = as.numeric(max(train.cases$ds)),color="red",linetype="dashed") + scale_fill_discrete(name = "Status") + theme(legend.position="none") + geom_point(aes(color=weekdays(ds))),width = 1100)
+```  
+
+**Bulk Cases Projected by Week and Day**
+```{r weeknum graph bulk, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+table_bulk <- forecast_table(test_combined,2)
+table_plot(table_bulk)
+```
+
+**Forecasted Associates Required**  
+The anticipated hours of associates are calculated from a pick rate in bulk of **`r ifelse(RDC=="FRG",FRG.Bulk,GRM.Bulk)`** cases per hour and **`r ifelse(RDC=="FRG",FRG.nethours,GRM.nethours)`** net hours worked by associate and an average utilization of **`r ifelse(RDC=="FRG",FRG.utilization * 100,GRM.utilization * 100)`**%.
+```{r totalhoursbyday graph bulk, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+table_plot(table_bulk %>%
+  mutate(Monday = round(Monday / (ifelse(RDC=="FRG",FRG.Bulk,GRM.Bulk)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Tuesday = round(Tuesday / (ifelse(RDC=="FRG",FRG.Bulk,GRM.Bulk)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Wednesday = round(Wednesday / (ifelse(RDC=="FRG",FRG.Bulk,GRM.Bulk)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Thursday = round(Thursday / (ifelse(RDC=="FRG",FRG.Bulk,GRM.Bulk)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Friday = round(Friday / (ifelse(RDC=="FRG",FRG.Bulk,GRM.Bulk)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Saturday = round(Saturday / (ifelse(RDC=="FRG",FRG.Bulk,GRM.Bulk)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Sunday = round(Sunday / (ifelse(RDC=="FRG",FRG.Bulk,GRM.Bulk)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0)))
+```
+
+###Bread
+**Bread Cases Projected by Day**
+```{r totalbyday graph brd, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+ggplotly(ggplot((test_combined %>%
+        filter(item == 3, ds > graph_ds) %>%
+        group_by(ds) %>%
+        summarise(cases = sum(y))), aes(x = ds, y = cases)) + geom_line() +                 theme_fivethirtyeight() + geom_vline(xintercept = as.numeric(max(train.cases$ds)),color="red",linetype="dashed") + scale_fill_discrete(name = "Status") + theme(legend.position="none") + geom_point(aes(color=weekdays(ds))),width = 1100)
+```  
+
+**Bread Cases Projected by Week and Day**
+```{r weeknum graph brd, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+table_bread <- forecast_table(test_combined,3)
+table_plot(table_bread)
+```
+
+**Forecasted Associates Required**  
+The anticipated number of associates are calculated from a pick rate in bread of **`r ifelse(RDC=="FRG",FRG.Bread,GRM.Bread)`** cases per hour and **`r ifelse(RDC=="FRG",FRG.nethours,GRM.nethours)`** net hours worked by associate and an average utilization of **`r ifelse(RDC=="FRG",FRG.utilization * 100,GRM.utilization * 100)`**%.
+```{r totalhoursbyday graph bread, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+table_plot(table_bread %>%
+  mutate(Monday = round(Monday / (ifelse(RDC=="FRG",FRG.Bread,GRM.Bread)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Tuesday = round(Tuesday / (ifelse(RDC=="FRG",FRG.Bread,GRM.Bread)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Wednesday = round(Wednesday / (ifelse(RDC=="FRG",FRG.Bread,GRM.Bread)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Thursday = round(Thursday / (ifelse(RDC=="FRG",FRG.Bread,GRM.Bread)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Friday = round(Friday / (ifelse(RDC=="FRG",FRG.Bread,GRM.Bread)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Saturday = round(Saturday / (ifelse(RDC=="FRG",FRG.Bread,GRM.Bread)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Sunday = round(Sunday / (ifelse(RDC=="FRG",FRG.Bread,GRM.Bread)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0)))
+```
+
+###Produce
+**Bread Cases Projected by Day**
+```{r totalbyday graph prd, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+ggplotly(ggplot((test_combined %>%
+        filter(item == 4, ds > graph_ds) %>%
+        group_by(ds) %>%
+        summarise(cases = sum(y))), aes(x = ds, y = cases)) + geom_line() +                 theme_fivethirtyeight() + geom_vline(xintercept = as.numeric(max(train.cases$ds)),color="red",linetype="dashed") + scale_fill_discrete(name = "Status") + theme(legend.position="none") + geom_point(aes(color=weekdays(ds))),width = 1100)
+```  
+
+**Bread Cases Projected by Week and Day**
+```{r weeknum graph prd, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+table_produce <- forecast_table(test_combined,4)
+table_plot(table_produce)
+```
+
+**Forecasted Associates Required**  
+The anticipated number of associates are calculated from a pick rate in produce of **`r ifelse(RDC=="FRG",FRG.Produce,GRM.Produce)`** cases per hour and **`r ifelse(RDC=="FRG",FRG.nethours,GRM.nethours)`** net hours worked by associate and an average utilization of **`r ifelse(RDC=="FRG",FRG.utilization * 100,GRM.utilization * 100)`**%.
+```{r totalhoursbyday graph produce, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+table_plot(table_produce %>%
+  mutate(Monday = round(Monday / (ifelse(RDC=="FRG",FRG.Produce,GRM.Produce)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Tuesday = round(Tuesday / (ifelse(RDC=="FRG",FRG.Produce,GRM.Produce)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Wednesday = round(Wednesday / (ifelse(RDC=="FRG",FRG.Produce,GRM.Produce)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Thursday = round(Thursday / (ifelse(RDC=="FRG",FRG.Produce,GRM.Produce)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Friday = round(Friday / (ifelse(RDC=="FRG",FRG.Produce,GRM.Produce)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Saturday = round(Saturday / (ifelse(RDC=="FRG",FRG.Produce,GRM.Produce)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Sunday = round(Sunday / (ifelse(RDC=="FRG",FRG.Produce,GRM.Produce)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0)))
+```
+
+###Chiller
+**Chiller Cases Projected by Day**
+```{r totalbyday graph chl, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+ggplotly(ggplot((test_combined %>%
+        filter(item == 5, ds > graph_ds) %>%
+        group_by(ds) %>%
+        summarise(cases = sum(y))), aes(x = ds, y = cases)) + geom_line() +                 theme_fivethirtyeight() + geom_vline(xintercept = as.numeric(max(train.cases$ds)),color="red",linetype="dashed") + scale_fill_discrete(name = "Status") + theme(legend.position="none") + geom_point(aes(color=weekdays(ds))),width = 1100)
+```  
+
+**Chiller Cases Projected by Week and Day**
+```{r weeknum graph chl, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+table_chiller <- forecast_table(test_combined,5)
+table_plot(table_chiller)
+```
+
+**Forecasted Associates Required**  
+The anticipated number of associates are calculated from a pick rate in chiller of **`r ifelse(RDC=="FRG",FRG.Chiller,GRM.Chiller)`** cases per hour and **`r ifelse(RDC=="FRG",FRG.nethours,GRM.nethours)`** net hours worked by associate and an average utilization of **`r ifelse(RDC=="FRG",FRG.utilization * 100,GRM.utilization * 100)`**%.
+```{r totalhoursbyday graph chiller, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+table_plot(table_chiller %>%
+  mutate(Monday = round(Monday / (ifelse(RDC=="FRG",FRG.Chiller,GRM.Chiller)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Tuesday = round(Tuesday / (ifelse(RDC=="FRG",FRG.Chiller,GRM.Chiller)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Wednesday = round(Wednesday / (ifelse(RDC=="FRG",FRG.Chiller,GRM.Chiller)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Thursday = round(Thursday / (ifelse(RDC=="FRG",FRG.Chiller,GRM.Chiller)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Friday = round(Friday / (ifelse(RDC=="FRG",FRG.Chiller,GRM.Chiller)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Saturday = round(Saturday / (ifelse(RDC=="FRG",FRG.Chiller,GRM.Chiller)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Sunday = round(Sunday / (ifelse(RDC=="FRG",FRG.Chiller,GRM.Chiller)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0)))
+```
+
+###Meat
+**Meat Cases Projected by Day**
+```{r totalbyday graph meat, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+ggplotly(ggplot((test_combined %>%
+        filter(item == 6, ds > graph_ds) %>%
+        group_by(ds) %>%
+        summarise(cases = sum(y))), aes(x = ds, y = cases)) + geom_line() +                 theme_fivethirtyeight() + geom_vline(xintercept = as.numeric(max(train.cases$ds)),color="red",linetype="dashed") + scale_fill_discrete(name = "Status") + theme(legend.position="none") + geom_point(aes(color=weekdays(ds))),width = 1100)
+```  
+
+**Meat Cases Projected by Week and Day**
+```{r weeknum graph meat, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+table_meat <- forecast_table(test_combined,6)
+table_plot(table_meat)
+```
+
+**Forecasted Associates Required**  
+The anticipated number of associates are calculated from a pick rate in meat of **`r ifelse(RDC=="FRG",FRG.Meat,GRM.Meat)`** cases per hour and **`r ifelse(RDC=="FRG",FRG.nethours,GRM.nethours)`** net hours worked by associate and an average utilization of **`r ifelse(RDC=="FRG",FRG.utilization * 100,GRM.utilization * 100)`**%.
+```{r totalhoursbyday graph meat, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+table_plot(table_meat %>%
+  mutate(Monday = round(Monday / (ifelse(RDC=="FRG",FRG.Meat,GRM.Meat)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Tuesday = round(Tuesday / (ifelse(RDC=="FRG",FRG.Meat,GRM.Meat)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Wednesday = round(Wednesday / (ifelse(RDC=="FRG",FRG.Meat,GRM.Meat)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Thursday = round(Thursday / (ifelse(RDC=="FRG",FRG.Meat,GRM.Meat)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Friday = round(Friday / (ifelse(RDC=="FRG",FRG.Meat,GRM.Meat)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Saturday = round(Saturday / (ifelse(RDC=="FRG",FRG.Meat,GRM.Meat)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Sunday = round(Sunday / (ifelse(RDC=="FRG",FRG.Meat,GRM.Meat)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0)))
+```
+
+###Freezer
+**Freezer Cases Projected by Day**
+```{r totalbyday graph frz, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+ggplotly(ggplot((test_combined %>%
+        filter(item == 7, ds > graph_ds) %>%
+        group_by(ds) %>%
+        summarise(cases = sum(y))), aes(x = ds, y = cases)) + geom_line() +                 theme_fivethirtyeight() + geom_vline(xintercept = as.numeric(max(train.cases$ds)),color="red",linetype="dashed") + scale_fill_discrete(name = "Status") + theme(legend.position="none") + geom_point(aes(color=weekdays(ds))),width = 1100)
+```  
+
+**Freezer Cases Projected by Week and Day**
+```{r weeknum graph frz, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+table_freezer <- forecast_table(test_combined,7)
+table_plot(table_freezer)
+```
+
+**Forecasted Associates Required**  
+The anticipated number of associates are calculated from a pick rate in freezer of **`r ifelse(RDC=="FRG",FRG.Freezer,GRM.Freezer)`** cases per hour and **`r ifelse(RDC=="FRG",FRG.nethours,GRM.nethours)`** net hours worked by associate and an average utilization of **`r ifelse(RDC=="FRG",FRG.utilization * 100,GRM.utilization * 100)`**%.
+```{r totalhoursbyday graph freezer, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+table_plot(table_meat %>%
+  mutate(Monday = round(Monday / (ifelse(RDC=="FRG",FRG.Freezer,GRM.Freezer)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Tuesday = round(Tuesday / (ifelse(RDC=="FRG",FRG.Freezer,GRM.Freezer)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Wednesday = round(Wednesday / (ifelse(RDC=="FRG",FRG.Freezer,GRM.Freezer)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Thursday = round(Thursday / (ifelse(RDC=="FRG",FRG.Freezer,GRM.Freezer)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Friday = round(Friday / (ifelse(RDC=="FRG",FRG.Freezer,GRM.Freezer)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Saturday = round(Saturday / (ifelse(RDC=="FRG",FRG.Freezer,GRM.Freezer)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Sunday = round(Sunday / (ifelse(RDC=="FRG",FRG.Freezer,GRM.Freezer)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0)))
+```
+
+###Milk
+**Milk Cases Projected by Day**
+```{r totalbyday graph milk, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+ggplotly(ggplot((test_combined %>%
+        filter(item == 8, ds > graph_ds) %>%
+        group_by(ds) %>%
+        summarise(cases = sum(y))), aes(x = ds, y = cases)) + geom_line() +                 theme_fivethirtyeight() + geom_vline(xintercept = as.numeric(max(train.cases$ds)),color="red",linetype="dashed") + scale_fill_discrete(name = "Status") + theme(legend.position="none") + geom_point(aes(color=weekdays(ds))),width = 1100)
+```  
+
+**Milk Cases Projected by Week and Day**
+```{r weeknum graph milk, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+table_milk <- forecast_table(test_combined,8)
+table_plot(table_milk)
+```
+
+**Forecasted Associates Required**  
+The anticipated number of associates are calculated from a pick rate in milk of **`r ifelse(RDC=="FRG",FRG.Milk,GRM.Milk)`** cases per hour and **`r ifelse(RDC=="FRG",FRG.nethours,GRM.nethours)`** net hours worked by associate and an average utilization of **`r ifelse(RDC=="FRG",FRG.utilization * 100,GRM.utilization * 100)`**%.
+```{r totalhoursbyday graph milk, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+table_plot(table_milk %>%
+  mutate(Monday = round(Monday / (ifelse(RDC=="FRG",FRG.Milk,GRM.Milk)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Tuesday = round(Tuesday / (ifelse(RDC=="FRG",FRG.Milk,GRM.Milk)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Wednesday = round(Wednesday / (ifelse(RDC=="FRG",FRG.Milk,GRM.Milk)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Thursday = round(Thursday / (ifelse(RDC=="FRG",FRG.Milk,GRM.Milk)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Friday = round(Friday / (ifelse(RDC=="FRG",FRG.Milk,GRM.Milk)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Saturday = round(Saturday / (ifelse(RDC=="FRG",FRG.Milk,GRM.Milk)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Sunday = round(Sunday / (ifelse(RDC=="FRG",FRG.Milk,GRM.Milk)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0)))
+```
+
+###Non Food
+**Non Food Cases Projected by Day**
+```{r totalbyday graph nf, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+ggplotly(ggplot((test_combined %>%
+        filter(item == 9, ds > graph_ds) %>%
+        group_by(ds) %>%
+        summarise(cases = sum(y))), aes(x = ds, y = cases)) + geom_line() +                 theme_fivethirtyeight() + geom_vline(xintercept = as.numeric(max(train.cases$ds)),color="red",linetype="dashed") + scale_fill_discrete(name = "Status") + theme(legend.position="none") + geom_point(aes(color=weekdays(ds))),width = 1100)
+```  
+
+**Non Food Cases Projected by Week and Day**
+```{r weeknum graph nf, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+table_nf <- forecast_table(test_combined,9)
+table_plot(table_nf)
+```
+
+**Forecasted Associates Required**  
+The anticipated number of associates are calculated from a pick rate in non food of **`r ifelse(RDC=="FRG",FRG.NF,GRM.NF)`** cases per hour and **`r ifelse(RDC=="FRG",FRG.nethours,GRM.nethours)`** net hours worked by associate and an average utilization of **`r ifelse(RDC=="FRG",FRG.utilization * 100,GRM.utilization * 100)`**%.
+```{r totalhoursbyday graph nf, echo=FALSE, message=FALSE, fig.align='center', fig.width=15}
+table_plot(table_nf %>%
+  mutate(Monday = round(Monday / (ifelse(RDC=="FRG",FRG.NF,GRM.NF)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Tuesday = round(Tuesday / (ifelse(RDC=="FRG",FRG.NF,GRM.NF)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Wednesday = round(Wednesday / (ifelse(RDC=="FRG",FRG.NF,GRM.NF)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Thursday = round(Thursday / (ifelse(RDC=="FRG",FRG.NF,GRM.NF)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Friday = round(Friday / (ifelse(RDC=="FRG",FRG.NF,GRM.NF)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Saturday = round(Saturday / (ifelse(RDC=="FRG",FRG.NF,GRM.NF)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0),
+         Sunday = round(Sunday / (ifelse(RDC=="FRG",FRG.NF,GRM.NF)*ifelse(RDC=="FRG",FRG.workedhours,GRM.workedhours)),0)))
+```
+
+
+## Summary {.tabset .tabset-fade}
+
+### Estimated Cases
+```{r aggregate table, echo=FALSE,message=FALSE, fig.align='center'}
+
+area.num$item.num <- as.character(area.num$item.num)
+summary_table <- test_combined %>%
+  left_join(area.num, by = c("item" = "item.num")) %>%
+    group_by(ds,item.y) %>%
+      summarise(y = sum(y)) %>%
+        spread(item.y,y) %>%
+          filter(ds > (max(train.cases$ds) - as.difftime(27, unit="days")))
+
+summary_table[,-1] <- round(summary_table[,-1],0)
+summary_table[is.na(summary_table)] <- 0
+
+names(summary_table) <- c("ds","Bulk","Ambient","Non-Food","Bread","Chiller","Milk","Produce","Freezer","Meat")
+summary_table %>%
+  kable() %>%
+  kable_styling() %>%
+    row_spec(28:nrow(summary_table), bold = T, background = "lightgreen") %>%
+      scroll_box(height = "600px")
+
+
+```
+
+### Estimated Associates
+```{r aggregate hours table, echo=FALSE,message=FALSE, fig.align='center',eval=TRUE}
+
+summary_hours <- summary_table %>%
+  mutate(Bulk = ceiling(Bulk / (ifelse(RDC=="FRG",FRG.Bulk,GRM.Bulk))),
+        Ambient = ceiling(Ambient / ((ifelse(RDC=="FRG",FRG.Ambient,GRM.Ambient)) )),
+        `Non-Food` = ceiling(`Non-Food` / ((ifelse(RDC=="FRG",FRG.NF,GRM.NF)))),
+        Bread = ceiling(Bread / ((ifelse(RDC=="FRG",FRG.Bread,GRM.Bread)))),
+        Chiller = ceiling(Chiller / ((ifelse(RDC=="FRG",FRG.Ambient,GRM.Ambient)))),
+        Milk = ceiling(Milk / ((ifelse(RDC=="FRG",FRG.Milk,GRM.Milk)))),
+        Produce = ceiling(Produce / ((ifelse(RDC=="FRG",FRG.Produce,GRM.Produce)))),
+        Freezer = ceiling(Freezer / ((ifelse(RDC=="FRG",FRG.Ambient,GRM.Ambient)))),
+        Meat = ceiling(Meat / ((ifelse(RDC=="FRG",FRG.Ambient,GRM.Ambient)))),
+        Total = Bulk + Ambient + `Non-Food` + Bread + Chiller + Milk + Produce + Freezer + Meat
+        )
+summary_hours[is.na(summary_hours)] <- 0
+
+summary_hours %>%
+  kable() %>%
+  kable_styling() %>%
+    row_spec(28:nrow(summary_table), bold = T, background = "lightgreen") %>%
+      scroll_box(height = "600px")
+
+
+```
+
+##Assumptions  
+  
+####Source Data
+All case demand data comes from the report *Picked and delivered quantities* report in BW. This report bases data off of delivery date to store.  
+All store opening data is maintained in a spreadsheet that is updated periodically as new data becomes available.
+
+####Store Turnover
+There are 3 brackets to which a store could be assigned for demand forecasting purposes:    
+  1. *Stable Stores* - These are stores that have been open a minimum of **`r days_to_stabilize`** days. For these                             stores, their actual demand profile is used. It includes a weekly seasonality component along                         with how the store is trending. Holidays are are factored in and adjusted accordingly.  
+  2. *Developing Stores* - These ares stores that have already opened but not yet have not achieved stability which                              occurs at roughly **`r days_to_stabilize`** days. Due to this, each of these stores are modeled off either high, medium, or low turnover stores. Once they hit **`r days_to_stabilize`** days, they will begin using their own data.     
+  3. *Unopened Stores* - These stores are not yet opened but must be included for demand purposes because the pre-stocking of a store are some of the highest demands a store will ever have.
+
+####Store Classification Brackets  
+As mentioned above, for both developing stores and upopened stores, the demand profile of an older, more stable store was used. Each store under this category is assigned to either a "high", "medium", or "low" profile.  
+* *High* - Measured off **1215-Ashburn** and **1031-Woodbridge**. The turnover of these stores is generally around $350k/week.    
+* *Medium* - Measured off **1103-Norfolk** and **1033-Wake Forest**. The turnover of these stores is generally around $250k-$300k/week.  
+* *Low* - Measured off **1001-North Chesterfield** and **1010-Winston-Salem**. The turnover of these stores is generally around $200k/week.  
+
+```{r demand profiles, fig.align='center', echo=FALSE, message=FALSE}
+ggplot(combined_turnover %>% filter(reference.date > -10, reference.date < 100) %>% group_by(reference.date,proj.turnover) %>% summarise(y = sum(y)), aes(x = reference.date, y = y, color = proj.turnover)) + geom_line() + geom_smooth() + ylab("Cases Picked") + xlab("Reference Date in Regards to Opening")+ theme(legend.position="top")
+```
+
+####Forecasting Model Considerations  
+Stable stores use a particular forecasting methodology released from Facebook called "Prophet". With Prophet, the following considerations are taken into account:  
+* Holidays - the model will take into account the massive deivation that is caused from holidays. On many holidays, the RDCs will not be working and this will be taken into account. A weighting is applied to the holidays telling the model how much to base future holidays off previous ones.  
+* weekly Seasonality - the model will evaluate the ordering pattern of stores on a weekly basis to forecast. Every store will be different in this regard based on their ordering habits.  
+* Yearly Seasonality - currently this feature has been turned off as there is not enough historical data for the model to work with. Once there is 2-3 years of historical data for the stores, this will be applied.
